@@ -90,6 +90,7 @@ Annualized Sharpe, as a 2×2 (risk-free = 0 %, 252 trading days):
 ├── requirements.txt
 ├── LICENSE
 ├── run_master.py            # entry point — runs the full 2×2 scenario matrix
+├── research.ipynb           # Jupyter notebook — cointegration, reversion & equity plots
 └── src/
     ├── data_pipeline.py     # MarketDataPipeline  (+ PmxtFeed live-data adapter)
     ├── stat_lab.py          # StatLab: cointegration, OU half-life, rolling z-score
@@ -113,6 +114,12 @@ Run the full four-scenario comparison and print the Markdown table:
 
 ```bash
 python run_master.py
+```
+
+Or explore the visual research notebook (cointegration, mean reversion, equity curves):
+
+```bash
+jupyter notebook research.ipynb
 ```
 
 Each module is **independently runnable** and prints a self-contained,
