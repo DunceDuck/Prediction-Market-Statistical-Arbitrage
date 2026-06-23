@@ -1,0 +1,9 @@
+# Core dependencies — required to run the full backtest stack and every module demo.
+pandas>=2.0
+numpy>=1.24
+statsmodels>=0.14
+
+# Optional — live data ingestion via the `pmxt` unified prediction-market API
+# ("CCXT for prediction markets"). Only needed for PmxtFeed in src/data_pipeline.py;
+# run_master.py and all demos use self-contained synthetic data and do NOT need it.
+# pmxt>=2.51
