@@ -29,6 +29,10 @@ dist/
 # Claude Code local tooling (project settings, memory, transcripts)
 .claude/
 
+# Secrets / API keys (e.g. PMXT_API_KEY) -- never commit
+.env
+*.env
+
 # R session cruft
 .Rhistory
 .RData

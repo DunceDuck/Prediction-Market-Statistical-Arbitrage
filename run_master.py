@@ -110,8 +110,14 @@ def generate_raw_feeds(spec: DatasetSpec) -> tuple[pd.DataFrame, pd.DataFrame]:
     kt, kp = emit(k_true, drop_p=0.05)
     pt, pp = emit(p_true, drop_p=0.08)
 
-    kalshi_df = pd.DataFrame({"timestamp": kt.asi8 // 1_000_000, "price": kp})  # epoch ms
-    poly_df = pd.DataFrame({"timestamp": pt, "price": pp})                       # datetime
+    # Volume from an independent stream so prices/timestamps (and the published
+    # backtest results) are unchanged; the pipeline needs Price + Volume.
+    vrng = np.random.default_rng(spec.seed + 9973)
+    kvol = vrng.integers(20, 200, size=kp.size).astype(float)
+    pvol = vrng.integers(20, 200, size=pp.size).astype(float)
+
+    kalshi_df = pd.DataFrame({"timestamp": kt.asi8 // 1_000_000, "price": kp, "volume": kvol})  # epoch ms
+    poly_df = pd.DataFrame({"timestamp": pt, "price": pp, "volume": pvol})                        # datetime
     return kalshi_df, poly_df
 
 

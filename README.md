@@ -18,10 +18,12 @@ pipeline for that idea:
 
 | Stage | Module | What it does |
 |------|--------|--------------|
-| **1. Ingest & align** | [`src/data_pipeline.py`](src/data_pipeline.py) | Sync two raw, irregularly-clocked feeds onto a uniform time grid; forward-fill each venue; compute the spread. |
+| **1. Ingest & align** | [`src/data_pipeline.py`](src/data_pipeline.py) | Sync two raw Price+Volume feeds onto a uniform grid; track each venue's quote age and rolling volume to flag stale/illiquid minutes (`is_tradeable`), eliminating phantom liquidity. |
 | **2. Statistics** | [`src/stat_lab.py`](src/stat_lab.py) | Engle–Granger cointegration test; Ornstein–Uhlenbeck **half-life of mean reversion**; 60-period rolling **z-score**. |
 | **3. Signals** | [`src/signal_engine.py`](src/signal_engine.py) | Vectorized entry/exit (±2σ → mean), a **transaction-friction profitability filter**, and two risk modes (*indefinite hold* / *stop-loss with re-entry lockout*). |
-| **4. Backtest** | [`src/backtester.py`](src/backtester.py) | Look-ahead-free (`shift(1)`) execution, additive P&L equity curve, **annualized Sharpe**, **maximum drawdown**. |
+| **4. Backtest** | [`src/backtester.py`](src/backtester.py) | Look-ahead-free (`shift(1)`) execution **intersected with `is_tradeable`** (never fills on stale/illiquid quotes), additive P&L equity curve, **annualized Sharpe**, **max drawdown**, win rate, % capital locked. |
+| **5. Walk-forward** | [`src/walk_forward.py`](src/walk_forward.py) | Expanding-window walk-forward: per step, re-select the rolling window (from the OU half-life) and entry-z that maximize *friction-adjusted* Sharpe in-sample, then apply them strictly to the next out-of-sample day. No hardcoded parameters. |
+| **6. Execution** | [`src/execution_engine.py`](src/execution_engine.py) | Prediction-market reality: no native short (a "short" buys the **NO** leg), a fully-collateralized capital tracker that **blocks entries when cash is locked**, and **hold-to-resolution** P&L (no early close unless bid/ask data prices the slippage). The honest counterpart to the mark-to-market backtester. |
 
 **Platforms.** Kalshi quotes in **cents (0–100)** and Polymarket in **dollars
 (0–1)**. The pipeline is venue-agnostic, but the reference data adapter uses the
@@ -32,7 +34,7 @@ conversion. (The committed demos run on synthetic data and need no API access.)
 
 ```mermaid
 flowchart LR
-    A["Raw Kalshi & Polymarket feeds"] --> B["MarketDataPipeline<br/>align · ffill · spread"]
+    A["Raw Kalshi & Polymarket feeds (price + volume)"] --> B["MarketDataPipeline<br/>align · quote-age + rolling-volume · is_tradeable"]
     B --> C["StatLab<br/>cointegration · OU half-life · z-score"]
     C --> D["SignalEngine<br/>z-score signals · friction filter · risk modes"]
     D --> E["VectorizedBacktester<br/>shift(1) · equity · Sharpe · MaxDD"]
@@ -82,6 +84,36 @@ Annualized Sharpe, as a 2×2 (risk-free = 0 %, 252 trading days):
 
 ---
 
+## Out-of-Sample Tear Sheet (`master_oos.py`)
+
+`master_oos.py` runs the full chain **walk-forward → `shift(1)` → `is_tradeable`
+intersection → backtest** and prints an Out-of-Sample Performance Tear Sheet from
+**real pmxt market data**. With a `PMXT_API_KEY` (or explicit market slugs) it
+produces genuine, strictly out-of-sample numbers.
+
+> ⚠️ **The tear sheet below is ILLUSTRATIVE — synthetic data, NOT real results.**
+> In testing, pmxt's live cross-venue matcher only surfaced sparse, long-dated
+> markets (a handful of candles each) — not the months of overlapping
+> Kalshi↔Polymarket history a 30-day walk-forward needs. So the numbers shown are
+> from `python master_oos.py --illustrative` (synthetic), purely to demonstrate
+> the output format and that the methodology is strictly out-of-sample. For
+> genuine figures, point the script at a liquid market with real history:
+> `KALSHI_SLUG=… POLYMARKET_SLUG=… python master_oos.py`.
+
+| Metric | Value *(illustrative / synthetic)* |
+|:-----------------------------|------:|
+| OOS Annualized Sharpe Ratio  | 12.81 |
+| Maximum Drawdown             | −6.9 % |
+| Percentage of Capital Locked | 38.6 % |
+| Win Rate (executed trades)   | 85.0 % |
+
+*Walk-forward: expanding 30-day train / 1-day OOS, 30 folds; the rolling window and
+entry-z are re-selected each fold from the OU half-life by maximizing
+friction-adjusted Sharpe. Execution shifts signals one period (no look-ahead) and
+intersects them with `is_tradeable` so nothing trades on a stale/illiquid quote.*
+
+---
+
 ## Repository structure
 
 ```
@@ -89,13 +121,16 @@ Annualized Sharpe, as a 2×2 (risk-free = 0 %, 252 trading days):
 ├── README.md
 ├── requirements.txt
 ├── LICENSE
-├── run_master.py            # entry point — runs the full 2×2 scenario matrix
+├── run_master.py            # 2×2 scenario matrix (illustrative, synthetic)
+├── master_oos.py            # Out-of-Sample tear sheet — real pmxt data (--illustrative for synthetic demo)
 ├── research.ipynb           # Jupyter notebook — cointegration, reversion & equity plots
 └── src/
     ├── data_pipeline.py     # MarketDataPipeline  (+ PmxtFeed live-data adapter)
     ├── stat_lab.py          # StatLab: cointegration, OU half-life, rolling z-score
     ├── signal_engine.py     # SignalEngine: signals, friction filter, risk modes
-    └── backtester.py        # VectorizedBacktester: equity, Sharpe, max drawdown
+    ├── backtester.py        # VectorizedBacktester: shift(1) + is_tradeable, Sharpe, drawdown, win rate
+    ├── walk_forward.py      # WalkForwardOptimizer: expanding-window parameter optimization
+    └── execution_engine.py  # ExecutionEngine: collateralized, hold-to-resolution execution
 ```
 
 ---
@@ -116,6 +151,14 @@ Run the full four-scenario comparison and print the Markdown table:
 python run_master.py
 ```
 
+Print the Out-of-Sample tear sheet — real pmxt data (needs `PMXT_API_KEY` or slugs),
+or a clearly-labeled synthetic illustration:
+
+```bash
+KALSHI_SLUG=<ticker> POLYMARKET_SLUG=<slug> python master_oos.py   # real data
+python master_oos.py --illustrative                                # synthetic demo
+```
+
 Or explore the visual research notebook (cointegration, mean reversion, equity curves):
 
 ```bash
@@ -130,6 +173,8 @@ python src/data_pipeline.py     # alignment + spread on synthetic feeds
 python src/stat_lab.py          # cointegration + OU half-life + z-score
 python src/signal_engine.py     # signal generation + stop-loss lockout
 python src/backtester.py        # equity curve + Sharpe + drawdown
+python src/walk_forward.py      # walk-forward optimization -> out-of-sample signal
+python src/execution_engine.py  # collateralized prediction-market execution
 ```
 
 Wiring the stack on your own data:
@@ -182,7 +227,11 @@ test, and Sharpe/drawdown reference calculations).
 
 ## Limitations & disclaimer
 
-- The committed datasets are **synthetic**; no live market data is included.
+- All committed metrics (the 2×2 matrix and the tear sheet) are **illustrative, on
+  synthetic data**. Real cross-venue Kalshi↔Polymarket history with enough depth for
+  a walk-forward was not reachable via pmxt's live API in testing; `master_oos.py`
+  produces genuine, strictly out-of-sample figures when pointed at real data
+  (`PMXT_API_KEY` or explicit market slugs).
 - A production deployment would need: live `pmxt` data, explicit slippage /
   latency / partial-fill modeling, YES/NO outcome-orientation matching across
   venues, and walk-forward (out-of-sample) parameter validation.

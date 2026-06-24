@@ -80,6 +80,9 @@ class BacktestResult:
     annualized_return: float
     annualized_vol: float
     n_trades: int
+    n_round_trips: int
+    win_rate: float                # fraction of round-trip trades with positive P&L
+    pct_capital_locked: float      # avg fraction of time capital is deployed (time in market)
     total_costs: float
     n_days: int
     initial_capital: float
@@ -99,6 +102,9 @@ class BacktestResult:
             "annualized_return": round(self.annualized_return, 4),
             "annualized_vol": round(self.annualized_vol, 4),
             "n_trades": self.n_trades,
+            "n_round_trips": self.n_round_trips,
+            "win_rate": round(self.win_rate, 4),
+            "pct_capital_locked": round(self.pct_capital_locked, 4),
             "total_costs": round(self.total_costs, 6),
             "n_days": self.n_days,
         }
@@ -147,8 +153,14 @@ class VectorizedBacktester:
         position_col: str = "position",
         kalshi_col: str = _K,
         poly_col: str = _P,
+        tradeable_col: str = "is_tradeable",
     ) -> BacktestResult:
-        """Backtest a SignalEngine signal frame and return metrics + curves."""
+        """Backtest a SignalEngine signal frame and return metrics + curves.
+
+        If ``tradeable_col`` is present, signals are **intersected** with it
+        (untradeable minutes forced flat) so we never execute on a stale/illiquid
+        quote, then shifted by one bar to remove look-ahead.
+        """
         required = [spread_col, position_col, kalshi_col, poly_col]
         missing = [c for c in required if c not in signals.columns]
         if missing:
@@ -158,6 +170,11 @@ class VectorizedBacktester:
         position = signals[position_col].astype(float)
         p_kalshi = signals[kalshi_col].abs()
         p_poly = signals[poly_col].abs()
+
+        # --- Intersect with the tradeability mask: never act on stale/illiquid
+        # quotes. Untradeable minutes are forced flat before anything else. ---
+        if tradeable_col in signals.columns:
+            position = position.where(signals[tradeable_col].astype(bool), 0.0)
 
         # --- CRITICAL: shift execution forward one bar to remove look-ahead. ---
         # The signal decided at t-1 is the position held through bar t.
@@ -215,6 +232,20 @@ class VectorizedBacktester:
             else float("nan")
         )
 
+        # --- Trade-level stats: % capital locked (time in market) and win rate ---
+        pct_capital_locked = float((exec_position != 0).mean())
+        held = exec_position != 0
+        entry = held & ~held.shift(1, fill_value=False)
+        exit_bar = (~held) & held.shift(1, fill_value=False)
+        trade_id = entry.cumsum()                       # constant across a holding run
+        in_trade = held | exit_bar                       # include the closing bar's exit cost
+        if in_trade.any():
+            trade_pnl = net_pnl[in_trade].groupby(trade_id[in_trade]).sum()
+            n_round_trips = int(trade_pnl.shape[0])
+            win_rate = float((trade_pnl > 0).mean())
+        else:
+            n_round_trips, win_rate = 0, float("nan")
+
         frame = pd.DataFrame(
             {
                 "exec_position": exec_position,
@@ -236,6 +267,9 @@ class VectorizedBacktester:
             annualized_return=ann_return,
             annualized_vol=ann_vol,
             n_trades=n_trades,
+            n_round_trips=n_round_trips,
+            win_rate=win_rate,
+            pct_capital_locked=pct_capital_locked,
             total_costs=total_costs,
             n_days=n_days,
             initial_capital=self.initial_capital,

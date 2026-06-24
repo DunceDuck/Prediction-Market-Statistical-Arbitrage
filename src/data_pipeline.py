@@ -1,50 +1,38 @@
 """
 data_pipeline.py
-=======================
+================
 
 Data plumbing for a prediction-market statistical-arbitrage backtester.
 
-The core deliverable is :class:`MarketDataPipeline`, which ingests two *raw*
-historical price frames for the **same event/outcome** (e.g. the YES contract on
-Kalshi and the YES contract on Polymarket), aligns them onto a uniform 1-minute
-grid, forward-fills each venue independently, and emits a single synchronized
-frame carrying a ``price_spread`` column (``|kalshi - polymarket|`` per minute).
+:class:`MarketDataPipeline` ingests two *raw* tick-or-1-minute frames carrying
+**Price and Volume** for the same event on two venues (Kalshi, Polymarket),
+aligns them onto a uniform 1-minute grid, and emits a synchronized frame with a
+per-minute **``is_tradeable`` mask**.
 
-A thin, *optional* adapter :class:`PmxtFeed` is also provided. It wraps the
-``pmxt`` library ("CCXT for prediction markets", https://github.com/pmxt-dev/pmxt)
-to pull OHLCV candles from either venue and return tidy price frames that drop
-straight into :class:`MarketDataPipeline`.
+Eliminating "phantom liquidity"
+-------------------------------
+A naive ``ffill()`` is dangerous in a backtest: when a venue stops quoting, the
+last price is carried forward indefinitely and *looks* like a live, fillable
+quote. A strategy then "trades" against a price nobody was actually showing —
+**phantom liquidity** — which silently inflates fills and returns.
 
-Why pmxt as the data source
----------------------------
-* One unified client covers **both** Kalshi and Polymarket (and others), so we
-  do not maintain two bespoke API clients with two different auth schemes.
-* It normalizes prices on every venue to a **0.0-1.0 probability scale**.
-  Natively Kalshi quotes cents (0-100) and Polymarket quotes 0-1; pmxt removes
-  that unit mismatch, which is precisely what makes a cross-venue price spread
-  meaningful without manual rescaling.
-* It ships a free historical OHLCV archive (archive.pmxt.dev) suitable for
-  backtests.
+This pipeline still carries the last price forward (so a value exists for marking
+and spread computation), but it never lets that be mistaken for tradeable
+liquidity. Two guards are tracked per venue, per minute:
 
-The alternative -- ``kalshi-python`` + ``py-clob-client`` wired up separately --
-works, but you pay for it with two clients, two auth flows, and a manual
-cents->probability conversion that pmxt does for you. The pipeline below is
-deliberately source-agnostic, so either path produces identical results.
+1. **``quote_age``** — minutes since the last *fresh* print. A new print resets it
+   to 0; each carried-forward minute increments it. A quote older than ``max_age``
+   is stale.
+2. **rolling volume** — the trailing ``vol_window``-minute traded volume. Zero
+   recent volume means the book is dry even if a price is being quoted.
 
-Design notes that matter for a quant
--------------------------------------
-* **Aggregation within a minute.** Sub-minute ticks are collapsed with ``last``
-  (the closing quote of the minute) by default -- the price you could actually
-  have transacted at the bar close. Configurable via ``agg``.
-* **Forward-fill is per-venue and only fills *after* a venue's first print.**
-  A stale quote is the best available estimate of the current price, but we
-  never fabricate a price for a venue before it has traded (no look-back filling
-  across the leading edge) or after it has closed (no filling past the last
-  print).
-* **Tradeable window.** With ``trim_to_overlap=True`` (default) the result is
-  trimmed to the intersection where *both* venues are live, which is the only
-  window in which a cross-venue spread is economically real. Inside that window
-  the frame is gap-free, so ``price_spread`` is fully defined.
+:meth:`filter_stale_quotes` combines them into ``is_tradeable``: a minute is
+**untradeable (False)** if *either* venue's ``quote_age`` exceeds ``max_age`` *or*
+*either* venue's rolling volume is 0. Both legs must be fresh **and** liquid to
+trade the spread, since execution requires hitting both books.
+
+A thin, optional :class:`PmxtFeed` adapter wraps the ``pmxt`` library to pull
+OHLCV candles (which already carry volume) from either venue.
 """
 
 from __future__ import annotations
@@ -64,63 +52,77 @@ _VALID_AGGS = {"last", "first", "mean", "median", "max", "min"}
 
 
 class MarketDataPipeline:
-    """Synchronize two prediction-market price histories onto a common grid.
+    """Synchronize two venue price/volume feeds and flag tradeable minutes.
 
     Parameters
     ----------
     freq:
         Resampling frequency for the uniform grid. Defaults to ``"1min"``.
-    price_col:
-        Name of the price column to read from each input frame. Defaults to
-        ``"price"``. (:class:`PmxtFeed` emits a ``"price"`` column = candle close.)
+    price_col, volume_col:
+        Column names for price and volume in each input frame. Default
+        ``"price"`` / ``"volume"``.
     timestamp_col:
-        Name of the column holding timestamps. If ``None`` (default), the frame's
-        existing index is used as the timestamp source.
+        Column holding timestamps. If ``None`` (default), the frame's index is used.
     timestamp_unit:
-        Unit for *epoch-integer* timestamps (``"s"``, ``"ms"``, ``"us"``, ``"ns"``).
-        If ``None``, the unit is inferred from the magnitude of the values. Ignored
-        for already-datetime or string timestamps.
+        Unit for epoch-integer timestamps (``"s"``/``"ms"``/``"us"``/``"ns"``);
+        inferred from magnitude if ``None``.
     agg:
-        Within-bin aggregation applied during resampling. One of
-        ``{"last", "first", "mean", "median", "max", "min"}``. Defaults to ``"last"``.
+        Within-minute price aggregation (default ``"last"`` -- the bar's closing
+        quote). Volume is always **summed** within the minute.
     tz:
         Target timezone for the index. Defaults to ``"UTC"``.
-    trim_to_overlap:
-        If ``True`` (default), trim the output to the window where both venues
-        have data, yielding a gap-free, fully-defined spread series. If ``False``,
-        keep the full union of both ranges (leading/trailing minutes where only one
-        venue exists will have ``NaN`` spread).
+    max_age:
+        Maximum tolerated ``quote_age`` (minutes) before a quote is stale.
+        Default 5.
+    vol_window:
+        Look-back (minutes) for the rolling traded-volume liquidity check.
+        Default 5.
     scale_check:
-        If ``True`` (default), emit a warning when the two price series appear to
-        be on different scales (e.g. one in 0-1, the other in cents), which would
-        make the spread meaningless.
+        If ``True`` (default), warn when the two price series look like they are on
+        different scales (0-1 vs cents).
     """
 
     KALSHI_COL = "kalshi_price"
     POLYMARKET_COL = "polymarket_price"
     SPREAD_COL = "price_spread"
+    TRADEABLE_COL = "is_tradeable"
+    KALSHI_AGE = "kalshi_quote_age"
+    POLYMARKET_AGE = "polymarket_quote_age"
+    KALSHI_VOL = "kalshi_volume"
+    POLYMARKET_VOL = "polymarket_volume"
+    KALSHI_RVOL = "kalshi_roll_vol"
+    POLYMARKET_RVOL = "polymarket_roll_vol"
 
     def __init__(
         self,
         freq: str = "1min",
         price_col: str = "price",
+        volume_col: str = "volume",
         timestamp_col: Optional[str] = None,
         timestamp_unit: Optional[str] = None,
         agg: str = "last",
         tz: str = "UTC",
-        trim_to_overlap: bool = True,
+        max_age: int = 5,
+        vol_window: int = 5,
         scale_check: bool = True,
     ) -> None:
         if agg not in _VALID_AGGS:
             raise ValueError(f"agg must be one of {sorted(_VALID_AGGS)}, got {agg!r}")
+        if max_age < 0:
+            raise ValueError("max_age must be non-negative")
+        if vol_window < 1:
+            raise ValueError("vol_window must be >= 1")
         self.freq = freq
         self.price_col = price_col
+        self.volume_col = volume_col
         self.timestamp_col = timestamp_col
         self.timestamp_unit = timestamp_unit
         self.agg = agg
         self.tz = tz
-        self.trim_to_overlap = trim_to_overlap
+        self.max_age = max_age
+        self.vol_window = vol_window
         self.scale_check = scale_check
+        self._synced: Optional[pd.DataFrame] = None
 
     # ------------------------------------------------------------------ #
     # Public API
@@ -130,82 +132,128 @@ class MarketDataPipeline:
         kalshi_df: pd.DataFrame,
         polymarket_df: pd.DataFrame,
     ) -> pd.DataFrame:
-        """Align two raw price frames and compute the per-minute price spread.
-
-        Parameters
-        ----------
-        kalshi_df, polymarket_df:
-            Raw historical price frames for the *same* outcome. Each must expose a
-            price column (``price_col``) and a timestamp source (``timestamp_col``
-            or the index).
+        """Align two raw price/volume frames onto a 1-minute grid with staleness
+        and liquidity tracking, and attach the ``is_tradeable`` mask.
 
         Returns
         -------
         pandas.DataFrame
             Indexed by a tz-aware 1-minute ``DatetimeIndex`` named ``timestamp``,
-            with columns ``[kalshi_price, polymarket_price, price_spread]``.
+            with columns: ``kalshi_price``, ``polymarket_price``, ``price_spread``,
+            ``kalshi_quote_age``, ``polymarket_quote_age``, ``kalshi_volume``,
+            ``polymarket_volume``, ``kalshi_roll_vol``, ``polymarket_roll_vol``,
+            and ``is_tradeable``.
         """
-        kalshi = self._to_price_series(kalshi_df, "kalshi")
-        poly = self._to_price_series(polymarket_df, "polymarket")
+        legs = {}
+        for label, raw in (("kalshi", kalshi_df), ("polymarket", polymarket_df)):
+            price, volume = self._clean_leg(raw, label)
+            legs[label] = (
+                price.resample(self.freq).agg(self.agg),  # last price (NaN if empty)
+                volume.resample(self.freq).sum(),          # total volume (0 if empty)
+            )
 
         if self.scale_check:
-            self._warn_on_scale_mismatch(kalshi, poly)
+            self._warn_on_scale_mismatch(
+                legs["kalshi"][0].dropna(), legs["polymarket"][0].dropna()
+            )
 
-        # Resample to the uniform grid and forward-fill EACH venue independently.
-        kalshi_grid = self._resample_ffill(kalshi).rename(self.KALSHI_COL)
-        poly_grid = self._resample_ffill(poly).rename(self.POLYMARKET_COL)
+        # Common 1-minute grid spanning both venues (union of the per-leg grids).
+        common = legs["kalshi"][0].index.union(legs["polymarket"][0].index)
 
-        # Outer-join on the union of the two minute grids. Both grids are anchored
-        # to minute boundaries, so they align exactly on shared minutes.
-        synced = pd.concat([kalshi_grid, poly_grid], axis=1)
+        cols = {}
+        names = {
+            "kalshi": (self.KALSHI_COL, self.KALSHI_AGE, self.KALSHI_VOL, self.KALSHI_RVOL),
+            "polymarket": (self.POLYMARKET_COL, self.POLYMARKET_AGE,
+                           self.POLYMARKET_VOL, self.POLYMARKET_RVOL),
+        }
+        for label in ("kalshi", "polymarket"):
+            price_1m, vol_1m = legs[label]
+            price_1m = price_1m.reindex(common)          # NaN where this venue is silent
+            vol_1m = vol_1m.reindex(common).fillna(0.0)   # no ticks -> 0 volume
+            pcol, acol, vcol, rcol = names[label]
+            cols[acol] = self._quote_age(price_1m)        # staleness BEFORE ffill
+            cols[pcol] = price_1m.ffill()                 # value carried forward
+            cols[vcol] = vol_1m
+            cols[rcol] = vol_1m.rolling(self.vol_window, min_periods=1).sum()
 
-        if self.trim_to_overlap:
-            synced = self._trim_to_overlap(synced)
+        synced = pd.DataFrame(cols, index=common)
+        synced.index.name = "timestamp"
 
-        # price_spread = |kalshi - polymarket| at every minute (numpy abs).
-        # NaN on either side (only possible outside the overlap) propagates to NaN,
-        # so we never report a spread against a non-existent quote.
+        # Drop the leading region before BOTH venues have printed a first quote
+        # (price is genuinely undefined there). Everything after is kept; stale or
+        # illiquid minutes remain in the frame but are flagged untradeable.
+        both_quoted = synced[[self.KALSHI_COL, self.POLYMARKET_COL]].notna().all(axis=1)
+        if not both_quoted.any():
+            raise ValueError("Kalshi and Polymarket histories never overlap in time.")
+        synced = synced.loc[both_quoted.idxmax():]
+
         synced[self.SPREAD_COL] = np.abs(
             synced[self.KALSHI_COL] - synced[self.POLYMARKET_COL]
         )
 
-        synced.index.name = "timestamp"
+        self._synced = synced
+        synced[self.TRADEABLE_COL] = self.filter_stale_quotes(self.max_age)
+
+        ordered = [
+            self.KALSHI_COL, self.POLYMARKET_COL, self.SPREAD_COL,
+            self.KALSHI_AGE, self.POLYMARKET_AGE,
+            self.KALSHI_VOL, self.POLYMARKET_VOL,
+            self.KALSHI_RVOL, self.POLYMARKET_RVOL,
+            self.TRADEABLE_COL,
+        ]
+        synced = synced[ordered]
+        self._synced = synced
         return synced
 
+    def filter_stale_quotes(self, max_age: int = 5) -> pd.Series:
+        """Boolean tradeability mask over the synchronized frame.
+
+        A minute is ``False`` (untradeable) if **either** venue's ``quote_age``
+        exceeds ``max_age`` **or** **either** venue's rolling volume is 0 -- i.e.
+        a minute is tradeable only when both legs are simultaneously *fresh* and
+        *liquid*. Call :meth:`synchronize` first.
+        """
+        if self._synced is None:
+            raise RuntimeError("Call synchronize() before filter_stale_quotes().")
+        df = self._synced
+        fresh = (df[self.KALSHI_AGE] <= max_age) & (df[self.POLYMARKET_AGE] <= max_age)
+        liquid = (df[self.KALSHI_RVOL] > 0) & (df[self.POLYMARKET_RVOL] > 0)
+        return (fresh & liquid).rename(self.TRADEABLE_COL)
+
     @staticmethod
-    def spread_summary(synced: pd.DataFrame, spread_col: str = SPREAD_COL) -> dict:
-        """Quick descriptive stats on the spread series (convenience for EDA)."""
-        s = synced[spread_col].dropna()
+    def spread_summary(synced: pd.DataFrame, spread_col: str = SPREAD_COL,
+                       tradeable_col: str = TRADEABLE_COL) -> dict:
+        """Descriptive stats on the spread, restricted to tradeable minutes if present."""
+        s = synced[spread_col]
+        if tradeable_col in synced.columns:
+            s = s[synced[tradeable_col]]
+        s = s.dropna()
         if s.empty:
             return {"n_minutes": 0}
         return {
             "n_minutes": int(s.shape[0]),
-            "start": synced.index.min(),
-            "end": synced.index.max(),
             "mean": float(s.mean()),
             "median": float(s.median()),
             "std": float(s.std()),
             "max": float(s.max()),
             "p95": float(s.quantile(0.95)),
-            "pct_gt_1c": float((s > 0.01).mean()),  # share of minutes wider than 1c
         }
 
     # ------------------------------------------------------------------ #
     # Internals
     # ------------------------------------------------------------------ #
-    def _to_price_series(self, df: pd.DataFrame, label: str) -> pd.Series:
-        """Return a clean, sorted, de-duplicated price Series on a DatetimeIndex."""
+    def _clean_leg(self, df: pd.DataFrame, label: str) -> "tuple[pd.Series, pd.Series]":
+        """Return cleaned, datetime-indexed (price, volume) Series for one venue."""
         if not isinstance(df, pd.DataFrame):
             raise TypeError(f"{label}: expected a pandas DataFrame, got {type(df)!r}")
         if df.empty:
             raise ValueError(f"{label}: dataframe is empty")
-        if self.price_col not in df.columns:
-            raise KeyError(
-                f"{label}: price_col {self.price_col!r} not found; "
-                f"columns are {list(df.columns)}"
-            )
+        for col in (self.price_col, self.volume_col):
+            if col not in df.columns:
+                raise KeyError(
+                    f"{label}: column {col!r} not found; columns are {list(df.columns)}"
+                )
 
-        # 1) Resolve the timestamp source -> tz-aware DatetimeIndex.
         if self.timestamp_col is not None:
             if self.timestamp_col not in df.columns:
                 raise KeyError(
@@ -216,19 +264,37 @@ class MarketDataPipeline:
         else:
             idx = self._coerce_datetime(np.asarray(df.index), label)
 
-        # 2) Coerce prices to numeric and assemble the Series.
-        price = pd.to_numeric(df[self.price_col], errors="coerce").to_numpy()
-        series = pd.Series(price, index=idx, name=label).sort_index()
+        leg = pd.DataFrame(
+            {
+                "price": pd.to_numeric(df[self.price_col], errors="coerce").to_numpy(),
+                "volume": pd.to_numeric(df[self.volume_col], errors="coerce")
+                .fillna(0.0)
+                .to_numpy(),
+            },
+            index=idx,
+        ).sort_index()
 
-        # 3) Drop unparseable prices and collapse duplicate timestamps (keep last).
-        series = series[~series.isna()]
-        series = series[~series.index.duplicated(keep="last")]
-        if series.empty:
-            raise ValueError(f"{label}: no valid numeric prices after cleaning")
-        return series
+        leg = leg[leg["price"].notna()]  # drop ticks with no usable price
+        if leg.empty:
+            raise ValueError(f"{label}: no valid (priced) rows after cleaning")
+        return leg["price"], leg["volume"]
+
+    @staticmethod
+    def _quote_age(price_1m: pd.Series) -> pd.Series:
+        """Minutes since the last fresh print (0 = fresh this minute).
+
+        Vectorized: group by the cumulative count of non-NaN prints; within each
+        group the first row is the fresh print (age 0) and subsequent carried-
+        forward rows increment. Minutes before the first-ever print are ``inf``
+        (no quote yet -> always untradeable).
+        """
+        valid = price_1m.notna()
+        grp = valid.cumsum()
+        age = price_1m.groupby(grp).cumcount().astype("float64")
+        return age.mask(grp == 0, np.inf)
 
     def _coerce_datetime(self, values: np.ndarray, label: str) -> pd.DatetimeIndex:
-        """Convert an array of timestamps (datetime / string / epoch) to tz-aware index."""
+        """Convert timestamps (datetime / string / epoch) to a tz-aware index."""
         s = pd.Series(np.asarray(values))
 
         if pd.api.types.is_datetime64_any_dtype(s):
@@ -245,8 +311,6 @@ class MarketDataPipeline:
             raise ValueError(
                 f"{label}: {int(dt.isna().sum())} timestamp(s) could not be parsed"
             )
-
-        # Localize naive indices, convert tz-aware ones, to the target tz.
         if dt.tz is None:
             dt = dt.tz_localize(self.tz)
         else:
@@ -270,23 +334,10 @@ class MarketDataPipeline:
             return "ms"
         return "s"
 
-    def _resample_ffill(self, series: pd.Series) -> pd.Series:
-        """Resample to the uniform grid (within-bin ``agg``) then forward-fill gaps."""
-        return series.resample(self.freq).agg(self.agg).ffill()
-
-    def _trim_to_overlap(self, synced: pd.DataFrame) -> pd.DataFrame:
-        """Trim to the minute range where both venues have a (ffilled) price."""
-        both_live = synced[[self.KALSHI_COL, self.POLYMARKET_COL]].notna().all(axis=1)
-        if not both_live.any():
-            raise ValueError(
-                "Kalshi and Polymarket price histories do not overlap in time; "
-                "no cross-venue spread can be computed."
-            )
-        live_index = synced.index[both_live]
-        return synced.loc[live_index[0] : live_index[-1]]
-
     def _warn_on_scale_mismatch(self, kalshi: pd.Series, poly: pd.Series) -> None:
         """Warn if the two series look like they are on different price scales."""
+        if kalshi.empty or poly.empty:
+            return
         k_max, p_max = float(kalshi.max()), float(poly.max())
         looks_prob = lambda x: x <= 1.5  # noqa: E731 - tiny local predicate
         if looks_prob(k_max) != looks_prob(p_max):
@@ -294,29 +345,25 @@ class MarketDataPipeline:
                 f"Possible price-unit mismatch: kalshi max={k_max:.4g}, "
                 f"polymarket max={p_max:.4g}. One series looks like 0-1 probability "
                 "and the other like cents/percent. price_spread will be meaningless "
-                "unless both are on the same scale -- pre-scale your inputs (e.g. "
-                "divide cents by 100) or pass already-normalized prices.",
+                "unless both are on the same scale.",
                 stacklevel=3,
             )
 
 
 class PmxtFeed:
-    """Optional adapter over the ``pmxt`` library to fetch venue price frames.
+    """Optional adapter over the ``pmxt`` library to fetch venue price/volume frames.
 
-    This wrapper is intentionally tolerant of the exact candle representation
-    (attribute-style ``PriceCandle`` objects, dicts, or ccxt-style lists), so it
-    keeps working across minor pmxt versions.
+    Tolerant of the candle representation (attribute-style ``PriceCandle`` objects,
+    dicts, or ccxt-style lists). The returned frame carries both ``price`` (close)
+    and ``volume`` -- exactly what the pipeline now needs.
 
     Example
     -------
     >>> import pmxt
-    >>> kalshi = pmxt.Kalshi()          # public reads; pass keys for trading
-    >>> poly = pmxt.Polymarket()
+    >>> kalshi, poly = pmxt.Kalshi(), pmxt.Polymarket()
     >>> feed = PmxtFeed()
-    >>> k_market = kalshi.fetch_market(slug="...")
-    >>> p_market = poly.fetch_market(slug="...")
-    >>> k_df = feed.fetch_ohlcv_frame(kalshi, k_market.yes, resolution="1m")
-    >>> p_df = feed.fetch_ohlcv_frame(poly, p_market.yes, resolution="1m")
+    >>> k_df = feed.fetch_ohlcv_frame(kalshi, kalshi.fetch_market(slug="...").yes, "1m")
+    >>> p_df = feed.fetch_ohlcv_frame(poly, poly.fetch_market(slug="...").yes, "1m")
     >>> synced = MarketDataPipeline().synchronize(k_df, p_df)
     """
 
@@ -334,11 +381,7 @@ class PmxtFeed:
         end=None,
         limit: Optional[int] = None,
     ) -> pd.DataFrame:
-        """Fetch OHLCV candles for one outcome and return a tidy price frame.
-
-        Returns a DataFrame indexed by a tz-aware ``DatetimeIndex`` with columns
-        ``[open, high, low, close, volume, price]`` where ``price`` is the close.
-        """
+        """Fetch OHLCV candles for one outcome and return a tidy price/volume frame."""
         kwargs = {"resolution": resolution}
         if start is not None:
             kwargs["start"] = self._to_datetime_param(start)
@@ -346,7 +389,6 @@ class PmxtFeed:
             kwargs["end"] = self._to_datetime_param(end)
         if limit is not None:
             kwargs["limit"] = limit
-
         candles = client.fetch_ohlcv(outcome_id, **kwargs)
         return self.candles_to_frame(candles, tz=self.tz)
 
@@ -360,34 +402,29 @@ class PmxtFeed:
         start=None,
         end=None,
         limit: Optional[int] = None,
-    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    ) -> "tuple[pd.DataFrame, pd.DataFrame]":
         """Fetch both venues' frames for the same event in one call."""
-        k_df = self.fetch_ohlcv_frame(
-            kalshi_client, kalshi_outcome, resolution, start, end, limit
-        )
-        p_df = self.fetch_ohlcv_frame(
-            polymarket_client, polymarket_outcome, resolution, start, end, limit
-        )
+        k_df = self.fetch_ohlcv_frame(kalshi_client, kalshi_outcome, resolution, start, end, limit)
+        p_df = self.fetch_ohlcv_frame(polymarket_client, polymarket_outcome, resolution, start, end, limit)
         return k_df, p_df
 
     @classmethod
     def candles_to_frame(cls, candles, tz: str = "UTC") -> pd.DataFrame:
-        """Normalize a sequence of pmxt candles into a price DataFrame."""
+        """Normalize a sequence of pmxt candles into a price/volume DataFrame."""
         rows = [[cls._candle_get(c, f) for f in cls._FIELDS] for c in candles]
         df = pd.DataFrame(rows, columns=list(cls._FIELDS))
         if df.empty:
             raise ValueError("fetch_ohlcv returned no candles for this outcome/window")
-        # pmxt timestamps are Unix milliseconds marking the start of each candle.
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
         if tz != "UTC":
             df["timestamp"] = df["timestamp"].dt.tz_convert(tz)
         df = df.set_index("timestamp").sort_index()
         df["price"] = pd.to_numeric(df["close"], errors="coerce")
+        df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0.0)
         return df
 
     @classmethod
     def _candle_get(cls, candle, field: str):
-        """Read one field from a candle regardless of its representation."""
         if hasattr(candle, field):
             return getattr(candle, field)
         if isinstance(candle, dict):
@@ -398,12 +435,7 @@ class PmxtFeed:
 
     @staticmethod
     def _to_datetime_param(value):
-        """Coerce a datetime-like value to a tz-aware ``datetime`` for pmxt.
-
-        pmxt's ``fetch_ohlcv`` types ``start``/``end`` as ``datetime.datetime``
-        (it does its own epoch conversion internally), so we hand it a real
-        timezone-aware datetime rather than an epoch integer.
-        """
+        """Coerce a datetime-like value to a tz-aware ``datetime`` for pmxt."""
         ts = pd.Timestamp(value)
         if ts.tz is None:
             ts = ts.tz_localize("UTC")
@@ -414,43 +446,60 @@ class PmxtFeed:
 # Self-contained demo (runs with only pandas + numpy -- no network/keys needed)
 # ---------------------------------------------------------------------------- #
 def _demo() -> None:
-    """Build two synthetic, irregular, partially-overlapping price feeds and sync."""
+    """Two 1-minute feeds with Price + Volume, each carrying a phantom-liquidity trap."""
     rng = np.random.default_rng(7)
-
-    # Kalshi: a print roughly every ~40s from 12:00, with random gaps, for ~90 min.
     base = pd.Timestamp("2026-06-22 12:00:00", tz="UTC")
-    k_offsets = np.cumsum(rng.integers(20, 70, size=160))  # seconds between prints
-    k_times = base + pd.to_timedelta(k_offsets, unit="s")
-    k_price = 0.50 + np.cumsum(rng.normal(0, 0.004, size=k_times.size))
-    k_price = np.clip(k_price, 0.01, 0.99)
-    kalshi_df = pd.DataFrame(
-        {"timestamp": (k_times.view("int64") // 1_000_000), "price": k_price}  # epoch ms
-    )
+    n = 120
+    minutes = base + pd.to_timedelta(np.arange(n), unit="min")
 
-    # Polymarket: starts 15 min later, ends earlier, different cadence -> tests overlap.
-    p_start = base + pd.Timedelta(minutes=15)
-    p_offsets = np.cumsum(rng.integers(15, 90, size=110))
-    p_times = p_start + pd.to_timedelta(p_offsets, unit="s")
-    p_price = k_price[0] + 0.01 + np.cumsum(rng.normal(0, 0.005, size=p_times.size))
-    p_price = np.clip(p_price, 0.01, 0.99)
-    poly_df = pd.DataFrame({"timestamp": p_times, "price": p_price})  # datetime, not epoch
+    k_price = np.clip(0.50 + np.cumsum(rng.normal(0, 0.003, n)), 0.05, 0.95)
+    p_price = np.clip(k_price + 0.01 + rng.normal(0, 0.004, n), 0.05, 0.95)
+    k_vol = rng.integers(40, 200, n).astype(float)
+    p_vol = rng.integers(40, 200, n).astype(float)
 
-    pipeline = MarketDataPipeline(freq="1min", price_col="price", timestamp_col="timestamp")
-    synced = pipeline.synchronize(kalshi_df, poly_df)
+    # Trap 1 -- Kalshi goes dark for 10 minutes (no prints): the last quote is
+    #           carried forward and would look live under naive ffill.
+    k_present = np.ones(n, dtype=bool)
+    k_present[40:50] = False
+    # Trap 2 -- Polymarket keeps printing a price but volume dries to 0: a fresh-
+    #           looking quote with no book behind it (classic phantom liquidity).
+    p_vol[80:96] = 0.0
 
-    pd.set_option("display.width", 120)
-    print("Raw inputs:")
-    print(f"  kalshi:     {len(kalshi_df):>4} ticks (epoch-ms timestamps)")
-    print(f"  polymarket: {len(poly_df):>4} ticks (datetime timestamps, starts +15m)\n")
-    print(f"Synchronized 1-minute frame: {synced.shape[0]} rows x {synced.shape[1]} cols")
-    print(f"NaNs in spread (should be 0 within overlap): {int(synced['price_spread'].isna().sum())}\n")
-    print("Head:")
-    print(synced.head(5).round(4))
-    print("\nTail:")
-    print(synced.tail(5).round(4))
-    print("\nSpread summary:")
-    for key, val in MarketDataPipeline.spread_summary(synced).items():
-        print(f"  {key:>10}: {val}")
+    kalshi_df = pd.DataFrame({
+        "timestamp": minutes[k_present].asi8 // 1_000_000,  # epoch ms
+        "price": k_price[k_present],
+        "volume": k_vol[k_present],
+    })
+    poly_df = pd.DataFrame({
+        "timestamp": minutes,                                # datetime
+        "price": p_price,
+        "volume": p_vol,
+    })
+
+    pipe = MarketDataPipeline(timestamp_col="timestamp", max_age=5, vol_window=5)
+    synced = pipe.synchronize(kalshi_df, poly_df)
+
+    n_min = len(synced)
+    n_ok = int(synced["is_tradeable"].sum())
+    pd.set_option("display.width", 130)
+    print(f"Synchronized minutes : {n_min}")
+    print(f"Tradeable            : {n_ok}  ({n_ok / n_min:.0%})")
+    print(f"Flagged UNTRADEABLE  : {n_min - n_ok}   "
+          f"(a naive ffill would have called all {n_min} tradeable -> phantom liquidity)\n")
+
+    print("Trap 1 — Kalshi goes dark (stale carried quote), 12:43–12:51:")
+    c1 = ["kalshi_price", "kalshi_quote_age", "kalshi_roll_vol", "is_tradeable"]
+    print(synced.loc[minutes[43]:minutes[51], c1].round(3).to_string())
+
+    print("\nTrap 2 — Polymarket quoting but zero volume (fresh quote, dry book), 13:22–13:38:")
+    c2 = ["polymarket_quote_age", "polymarket_volume", "polymarket_roll_vol", "is_tradeable"]
+    print(synced.loc[minutes[82]:minutes[98], c2].round(3).to_string())
+
+    strict = int(pipe.filter_stale_quotes(max_age=2).sum())
+    print(f"\nfilter_stale_quotes(max_age=2) is stricter: {strict} tradeable (vs {n_ok} at max_age=5)")
+    print("\nTradeable-only spread summary:")
+    for k, v in MarketDataPipeline.spread_summary(synced).items():
+        print(f"  {k:>10}: {v}")
 
 
 if __name__ == "__main__":
