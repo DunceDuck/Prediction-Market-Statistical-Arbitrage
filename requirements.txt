@@ -11,3 +11,8 @@ jupyter>=1.0
 # ("CCXT for prediction markets"). Only needed for PmxtFeed in src/data_pipeline.py;
 # run_master.py and all demos use self-contained synthetic data and do NOT need it.
 # pmxt>=2.51
+
+# Optional — live resolved-market pulls from Polymarket's public APIs (Gamma +
+# CLOB) in src/alpha_engine.py (PolymarketDataPuller). The mock generator and the
+# alpha_engine demo run on pandas + numpy alone and do NOT need it.
+# requests>=2.28
